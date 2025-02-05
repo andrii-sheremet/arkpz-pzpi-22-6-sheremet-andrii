@@ -82,7 +82,7 @@ class SensorData(ModelsBase):
 
     DataID: int = Column(Integer, primary_key=True, autoincrement=True)
     DeviceID: int = Column(Integer, ForeignKey('Devices.DeviceID'), nullable=False)
-    Timestamp: str = Column(DateTime, default=ModelsBase.func.current_timestamp())
+    Timestamp: str = Column(DateTime, default=func.current_timestamp())
     SoilMoisture: float = Column(Numeric(5, 2), nullable=False)
     LightLevel: float = Column(Numeric(5, 2), nullable=False)
     Temperature: float = Column(Numeric(5, 2), nullable=False)
@@ -106,7 +106,7 @@ class Notification(ModelsBase):
     NotificationID: int = Column(Integer, primary_key=True, autoincrement=True)
     UserID: int = Column(Integer, ForeignKey('Users.UserID'), nullable=False)
     Message: str = Column(String(255), nullable=False)
-    CreatedDate: str = Column(DateTime, default=ModelsBase.func.current_timestamp())
+    CreatedDate: str = Column(DateTime, default=func.current_timestamp())
     Status: str = Column(String(10), default='unread')
 
     def to_json(self) -> dict:
