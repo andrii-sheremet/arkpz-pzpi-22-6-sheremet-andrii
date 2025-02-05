@@ -1,201 +1,314 @@
-from flask import Flask, request, jsonify
+import json
+import ssl
+from datetime import datetime
+from time import time, UTC
+
+import bcrypt
+from flask import jsonify, request
 from flask_sqlalchemy import SQLAlchemy
-from flask_jwt_extended import JWTManager, jwt_required, create_access_token
-from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, Plant, Device, SensorData, Notification, Setting
-from datetime import timedelta
+import jwt
+from flask_mqtt import Mqtt
+from flask_openapi3 import OpenAPI
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-# Ініціалізація Flask-додатку
-app = Flask(__name__)
+from errors import NotAuthorizedError
+from models import User, Plant, Device, SensorData, Notification, Setting
+from request_models import UserRequestModel, RegisterRequest, PlantRequestModel, DeviceRequestModel, SensorDataRequestModel, NotificationRequestModel, SettingRequestModel
 
-# Налаштування бази даних і JWT
+app = OpenAPI(__name__, doc_prefix="/docs")
+JWT_EXPIRE_TIME = 60 * 60 * 24
+JWT_KEY = b"0123456789abcdef"
+
+app.config['SECRET_KEY'] = 'your_secret_key'
+
+app.config["MQTT_BROKER_URL"] = "localhost"
+app.config["MQTT_BROKER_PORT"] = 1883
+app.config["MQTT_USERNAME"] = ""
+app.config["MQTT_PASSWORD"] = "" 
+app.config["MQTT_KEEPALIVE"] = 60
+app.config["MQTT_TLS_ENABLED"] = False
+app.config["MQTT_TLS_INSECURE"] = False
+
+mqtt = Mqtt(app)
+
 app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:31415926@localhost/smart_plant_care'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'my_very_secret_key_12345'  # Змініть на секретний ключ
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
 
-# Ініціалізація бази даних та JWT
-db.init_app(app)
-jwt = JWTManager(app)
+db = SQLAlchemy(app)
 
-@app.route('/')
-def home():
-    return "Добро пожаловать на главную страницу!"
+@mqtt.on_connect()
+def handle_mqtt_connect(client, userdata, flags, rc):
+    mqtt.subscribe("smart_plant_care")
 
-# Реєстрація нового користувача
-@app.route('/auth/register', methods=['POST'])
-def register_user():
-    data = request.get_json()
-    username = data.get('username')
-    email = data.get('email')
-    password = data.get('password')
-    
-    if not username or not email or not password:
-        return jsonify({"msg": "Missing required fields"}), 400
-    
-    hashed_password = generate_password_hash(password, method='sha256')
-    
-    new_user = User(username=username, email=email, password_hash=hashed_password)
-    db.session.add(new_user)
+@mqtt.on_message()
+def handle_mqtt_message(client, userdata, message):
+    try:
+        payload = json.loads(message.payload)
+    except ValueError:
+        return
+
+    if message.topic != "smart_plant_care":
+        return
+
+    if "enabled" not in payload or "enabled_for" not in payload or "token" not in payload:
+        return
+
+    if not isinstance(payload["enabled"], bool) or not isinstance(payload["enabled_for"], (int, type(None))):
+        return
+
+@app.errorhandler(NotAuthorizedError)
+def handle_not_authorized(_):
+    return {"error": "Not authorized!"}, 401
+
+def auth_user(token: str) -> User:
+    token = jwt.decode(token, JWT_KEY, algorithms=["HS256"])
+    user = db.session.query(User).filter_by(id=token["user"]).scalar()
+    if user is None:
+        raise NotAuthorizedError
+
+    return user
+
+
+def auth_admin(token: str) -> User:
+    user = auth_user(token)
+    if not user.Role == "admin":
+        raise NotAuthorizedError
+
+    return user
+
+
+@app.post("/auth/register")
+def register(body: RegisterRequest):
+    if db.session.query(User).filter_by(Email=body.email).scalar() is not None:
+        return {"error": "User with this email already exists!"}, 400
+
+    password_hash = bcrypt.hashpw(body.password.encode("utf8"), bcrypt.gensalt()).decode("utf8")
+    user = User(Username=body.Username, Email=body.Email, PasswordHash=body.Password)
+    db.session.add(user)
     db.session.commit()
-    
-    return jsonify({"msg": "User created successfully"}), 201
 
-# Аутентифікація користувача
-@app.route('/auth/login', methods=['POST'])
-def login_user():
-    data = request.get_json()
-    email = data.get('email')
-    password = data.get('password')
-    
-    user = User.query.filter_by(email=email).first()
-    
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"msg": "Invalid credentials"}), 401
-    
-    access_token = create_access_token(identity=user.id)
-    return jsonify(access_token=access_token), 200
+    return {
+        "token": jwt.encode({
+            "user": user.id,
+            "exp": int(time() + JWT_EXPIRE_TIME)
+        }, JWT_KEY)
+    }
 
-# Отримання інформації про поточного користувача
+@app.post("/auth/login")
+def login(body: RegisterRequest):
+    user = db.session.query(User).filter_by(Email=body.Email).scalar()
+    if user is None:
+        return {"error": "User with this credentials does not exist!"}, 400
+
+    if not bcrypt.checkpw(body.Password.encode("utf8"), user.PasswordHash.encode("utf8")):
+        return {"error": "User with this credentials does not exist!"}, 400
+
+    return {
+        "token": jwt.encode({
+            "user": user.id,
+            "exp": int(time() + JWT_EXPIRE_TIME)
+        }, JWT_KEY, algorithm="HS256")
+    }
+
+# Получение информации о текущем пользователе
 @app.route('/users/me', methods=['GET'])
-@jwt_required()
-def get_current_user():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
-    
-    if not user:
-        return jsonify({"msg": "User not found"}), 404
-    
-    return jsonify({
-        "username": user.username,
-        "email": user.email
-    }), 200
+def get_user(current_user):
+    user_data = UserRequestModel.from_orm(current_user)
+    return jsonify(user_data.dict())
 
-# Оновлення профілю користувача
+# Обновление информации о пользователе
 @app.route('/users/me', methods=['PUT'])
-@jwt_required()
-def update_user_profile():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
-    
-    if not user:
-        return jsonify({"msg": "User not found"}), 404
-    
+def update_user(current_user):
     data = request.get_json()
-    if 'username' in data:
-        user.username = data['username']
-    if 'email' in data:
-        user.email = data['email']
+    try:
+        user_data = UserRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
+    
+    current_user.Email = user_data.Email
+    current_user.Username = user_data.Username
+    if user_data.PasswordHash:
+        current_user.PasswordHash = user_data.PasswordHash
     
     db.session.commit()
-    return jsonify({"msg": "User profile updated successfully"}), 200
+    return jsonify({'message': 'User profile updated successfully!'})
 
-# Додавання нової рослини
+# Добавление нового растения
 @app.route('/plants/', methods=['POST'])
-@jwt_required()
-def add_plant():
-    current_user_id = get_jwt_identity()
+def add_plant(current_user):
     data = request.get_json()
-    plant_name = data.get('plant_name')
-    plant_type = data.get('plant_type')
+    try:
+        plant_data = PlantRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
     
-    if not plant_name or not plant_type:
-        return jsonify({"msg": "Missing required fields"}), 400
-    
-    new_plant = Plant(user_id=current_user_id, plant_name=plant_name, plant_type=plant_type)
+    new_plant = Plant(UserID=current_user.id, PlantName=plant_data.PlantName, PlantType=plant_data.PlantType)
     db.session.add(new_plant)
     db.session.commit()
-    
-    return jsonify({"msg": "Plant added successfully"}), 201
+    return jsonify({'message': 'Plant added successfully!'}), 201
 
-# Отримання списку рослин користувача
+# Получение списка растений
 @app.route('/plants/', methods=['GET'])
-@jwt_required()
-def get_plants():
-    current_user_id = get_jwt_identity()
-    plants = Plant.query.filter_by(user_id=current_user_id).all()
-    
-    if not plants:
-        return jsonify({"msg": "No plants found for this user"}), 404
-    
-    plant_list = []
-    for plant in plants:
-        plant_list.append({
-            "plant_id": plant.id,
-            "plant_name": plant.plant_name,
-            "plant_type": plant.plant_type
-        })
-    
-    return jsonify(plant_list), 200
+def get_plants(current_user):
+    plants = Plant.query.filter_by(UserID=current_user.id).all()
+    plants_data = [PlantRequestModel.from_orm(plant).dict() for plant in plants]
+    return jsonify(plants_data)
 
-# Отримання даних сенсора для рослини
-@app.route('/plants/<int:plant_id>/sensor_data', methods=['GET'])
-@jwt_required()
-def get_sensor_data(plant_id):
-    current_user_id = get_jwt_identity()
-    plant = Plant.query.get(plant_id)
+# Получение информации о растении
+@app.route('/plants/<int:plant_id>', methods=['GET'])
+def get_plant(current_user, plant_id):
+    plant = Plant.query.filter_by(UserID=current_user.id, id=plant_id).first()
+    if not plant:
+        return jsonify({'message': 'Plant not found!'}), 404
+    plant_data = PlantRequestModel.from_orm(plant)
+    return jsonify(plant_data.dict())
+
+# Обновление информации о растении
+@app.route('/plants/<int:plant_id>', methods=['PUT'])
+def update_plant(current_user, plant_id):
+    data = request.get_json()
+    try:
+        plant_data = PlantRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
     
-    if not plant or plant.user_id != current_user_id:
-        return jsonify({"msg": "Plant not found or unauthorized access"}), 404
+    plant = Plant.query.filter_by(UserID=current_user.id, id=plant_id).first()
+    if not plant:
+        return jsonify({'message': 'Plant not found!'}), 404
+
+    plant.PlantName = plant_data.PlantName
+    plant.PlantType = plant_data.PlantType
+    db.session.commit()
+    return jsonify({'message': 'Plant updated successfully!'})
+
+# Удаление растения
+@app.route('/plants/<int:plant_id>', methods=['DELETE'])
+def delete_plant(current_user, plant_id):
+    plant = Plant.query.filter_by(UserID=current_user.id, id=plant_id).first()
+    if not plant:
+        return jsonify({'message': 'Plant not found!'}), 404
     
-    sensor_data = SensorData.query.filter_by(plant_id=plant_id).all()
+    db.session.delete(plant)
+    db.session.commit()
+    return jsonify({'message': 'Plant deleted successfully!'})
+
+# Добавление нового устройства
+@app.route('/devices/', methods=['POST'])
+def add_device(current_user):
+    data = request.get_json()
+    try:
+        device_data = DeviceRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
     
+    new_device = Device(UserID=current_user.id, DeviceType=device_data.DeviceType, Location=device_data.Location)
+    db.session.add(new_device)
+    db.session.commit()
+    return jsonify({'message': 'Device added successfully!'}), 201
+
+# Получение списка устройств
+@app.route('/devices/', methods=['GET'])
+def get_devices(current_user):
+    devices = Device.query.filter_by(UserID=current_user.id).all()
+    devices_data = [DeviceRequestModel.from_orm(device).dict() for device in devices]
+    return jsonify(devices_data)
+
+# Получение информации о устройстве
+@app.route('/devices/<int:device_id>', methods=['GET'])
+def get_device(current_user, device_id):
+    device = Device.query.filter_by(UserID=current_user.id, id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Device not found!'}), 404
+    device_data = DeviceRequestModel.from_orm(device)
+    return jsonify(device_data.dict())
+
+# Удаление устройства
+@app.route('/devices/<int:device_id>', methods=['DELETE'])
+def delete_device(current_user, device_id):
+    device = Device.query.filter_by(UserID=current_user.id, id=device_id).first()
+    if not device:
+        return jsonify({'message': 'Device not found!'}), 404
+    
+    db.session.delete(device)
+    db.session.commit()
+    return jsonify({'message': 'Device deleted successfully!'})
+
+# Получение последних показателей сенсора
+@app.route('/sensors/data/<int:device_id>', methods=['GET'])
+def get_sensor_data(current_user, device_id):
+    sensor_data = SensorData.query.filter_by(DeviceID=device_id).order_by(SensorData.Timestamp.desc()).first()
     if not sensor_data:
-        return jsonify({"msg": "No sensor data available for this plant"}), 404
-    
-    data = []
-    for sensor in sensor_data:
-        data.append({
-            "timestamp": sensor.timestamp,
-            "temperature": sensor.temperature,
-            "humidity": sensor.humidity,
-            "moisture": sensor.moisture
-        })
-    
-    return jsonify(data), 200
+        return jsonify({'message': 'No data found!'}), 404
+    sensor_data_response = SensorDataRequestModel.from_orm(sensor_data)
+    return jsonify(sensor_data_response.dict())
 
-# Оновлення налаштувань рослини (наприклад, полив або освітлення)
-@app.route('/plants/<int:plant_id>/settings', methods=['PUT'])
-@jwt_required()
-def update_plant_settings(plant_id):
-    current_user_id = get_jwt_identity()
-    plant = Plant.query.get(plant_id)
-    
-    if not plant or plant.user_id != current_user_id:
-        return jsonify({"msg": "Plant not found or unauthorized access"}), 404
-    
+# Отправка данных с сенсоров
+@app.route('/sensors/data', methods=['POST'])
+def post_sensor_data(current_user):
     data = request.get_json()
-    watering_schedule = data.get('watering_schedule')
-    lighting_schedule = data.get('lighting_schedule')
+    try:
+        sensor_data = SensorDataRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
     
-    if watering_schedule:
-        plant.watering_schedule = watering_schedule
-    if lighting_schedule:
-        plant.lighting_schedule = lighting_schedule
-    
+    new_sensor_data = SensorData(
+        DeviceID=sensor_data.DeviceID,
+        SoilMoisture=sensor_data.SoilMoisture,
+        LightLevel=sensor_data.LightLevel,
+        Temperature=sensor_data.Temperature,
+        Humidity=sensor_data.Humidity,
+        Timestamp=datetime.utcnow()
+    )
+    db.session.add(new_sensor_data)
     db.session.commit()
-    
-    return jsonify({"msg": "Plant settings updated successfully"}), 200
+    return jsonify({'message': 'Sensor data added successfully!'}), 201
 
-# Створення сповіщень (наприклад, нагадування про полив або освітлення)
-@app.route('/notifications', methods=['POST'])
-@jwt_required()
-def create_notification():
-    current_user_id = get_jwt_identity()
+# Получение уведомлений
+@app.route('/notifications/', methods=['GET'])
+def get_notifications(current_user):
+    notifications = Notification.query.filter_by(UserID=current_user.id).all()
+    notifications_data = [NotificationRequestModel.from_orm(notification).dict() for notification in notifications]
+    return jsonify(notifications_data)
+
+# Обновление статуса уведомления
+@app.route('/notifications/<int:notification_id>', methods=['PUT'])
+def mark_notification_read(current_user, notification_id):
+    notification = Notification.query.filter_by(UserID=current_user.id, id=notification_id).first()
+    if not notification:
+        return jsonify({'message': 'Notification not found!'}), 404
+    
+    notification.Status = 'read'
+    db.session.commit()
+    return jsonify({'message': 'Notification marked as read!'})
+
+# Получение настроек пользователя
+@app.route('/settings/', methods=['GET'])
+def get_settings(current_user):
+    settings = Setting.query.filter_by(UserID=current_user.id).first()
+    if not settings:
+        return jsonify({'message': 'Settings not found!'}), 404
+    settings_data = SettingRequestModel.from_orm(settings)
+    return jsonify(settings_data.dict())
+
+# Обновление настроек пользователя
+@app.route('/settings/', methods=['PUT'])
+def update_settings(current_user):
     data = request.get_json()
+    try:
+        settings_data = SettingRequestModel(**data)  # Validate incoming data
+    except Exception as e:
+        return jsonify({'message': str(e)}), 400
     
-    notification_type = data.get('notification_type')
-    content = data.get('content')
+    settings = Setting.query.filter_by(UserID=current_user.id).first()
+    if not settings:
+        return jsonify({'message': 'Settings not found!'}), 404
     
-    if not notification_type or not content:
-        return jsonify({"msg": "Missing required fields"}), 400
-    
-    new_notification = Notification(user_id=current_user_id, notification_type=notification_type, content=content)
-    db.session.add(new_notification)
+    settings.WateringSchedule = settings_data.WateringSchedule
+    settings.LightPreferences = settings_data.LightPreferences
+    settings.TemperatureRange = settings_data.TemperatureRange
     db.session.commit()
-    
-    return jsonify({"msg": "Notification created successfully"}), 201
+    return jsonify({'message': 'Settings updated successfully!'})
 
-# Основна функція запуску додатку
 if __name__ == '__main__':
     app.run(debug=True)

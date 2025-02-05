@@ -1,39 +1,51 @@
-from flask import Flask, request, jsonify
-from flask_marshmallow import Marshmallow
-from marshmallow import ValidationError
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+from pydantic import BaseModel, EmailStr, Field
 
-# Ініціалізація Flask та Marshmallow
-app = Flask(__name__)
-ma = Marshmallow(app)
+# Модель для пользователя
+class RegisterRequest(BaseModel):
+    Email: EmailStr
+    Password: str
+    Username: str
 
-# Модель для валідації вхідних даних
-class GreetingRequestSchema(ma.Schema):
-    name = ma.String(required=True, validate=lambda x: len(x) > 0, error_messages={"required": "Name is required", "null": "Name cannot be empty"})
+# Модель для пользователя
+class UserRequestModel(BaseModel):
+    Username: str
+    Email: str
+    PasswordHash: str
+    Role: Optional[str] = 'user'
 
-# Валідація запиту
-def validate_request_data(data):
-    try:
-        # Валідація за допомогою схемы Marshmallow
-        schema = GreetingRequestSchema()
-        return schema.load(data)  # Якщо дані правильні, повертається очищений об'єкт
-    except ValidationError as err:
-        return err.messages  # Повертає повідомлення про помилки валідації
+# Модель для растения
+class PlantRequestModel(BaseModel):
+    UserID: int
+    PlantName: str
+    PlantType: str
 
-# Створення API для обробки запитів
-@app.route('/api/greet', methods=['POST'])
-def greet():
-    data = request.get_json()
+# Модель для устройства
+class DeviceRequestModel(BaseModel):
+    UserID: int
+    DeviceType: str
+    Location: Optional[str] = None
 
-    # Викликаємо функцію для валідації даних
-    validation_result = validate_request_data(data)
+# Модель для данных сенсоров
+class SensorDataRequestModel(BaseModel):
+    DeviceID: int
+    SoilMoisture: float
+    LightLevel: float
+    Temperature: float
+    Humidity: float
+    Timestamp: Optional[datetime] = None
 
-    if isinstance(validation_result, dict):  # Якщо дані коректні
-        name = validation_result.get('name', 'Guest')
-        return jsonify(message=f"Hello, {name}!")
-    else:
-        # Якщо є помилки валідації, повертаємо їх клієнту
-        return jsonify(validation_result), 400
+# Модель для уведомления
+class NotificationRequestModel(BaseModel):
+    UserID: int
+    Message: str
+    Status: Optional[str] = 'unread'
 
-# Головна точка входу для запуску сервера
-if __name__ == '__main__':
-    app.run(debug=True)
+# Модель для настроек пользователя
+class SettingRequestModel(BaseModel):
+    UserID: int
+    WateringSchedule: str
+    LightPreferences: Optional[str] = None
+    TemperatureRange: Optional[str] = None
